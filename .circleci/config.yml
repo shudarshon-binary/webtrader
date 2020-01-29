@@ -91,10 +91,11 @@ jobs:
      # - k8s_deploy
       
 workflows:
+  version: 2
   release:
     jobs:
-      - release:
-          filters:
-            branches:
-              only: /^master$/
+      - release
+        #  filters:
+        #    branches:
+        #      only: /^master$/
 
