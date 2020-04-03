@@ -67,7 +67,7 @@ commands:
             mv artifact.tar ${OLDPWD}/
       - run:
           name: "Tag commit id as artifact identifer"
-          command: echo "${CIRCLE_SHA1}" > artifact-info.txt
+          command: echo "${CIRCLE_TAG}" > artifact-info.txt
 
   upload_artifact:
     description: "upload build artifact to s3 bucket"
@@ -78,7 +78,7 @@ commands:
           aws-access-key-id: env_CONTEXT_ARTIFACT_S3_AWS_ACCESS_KEY_ID
           aws-secret-access-key: env_CONTEXT_ARTIFACT_S3_AWS_SECRET_ACCESS_KEY
           aws-region: env_CONTEXT_ARTIFACT_S3_AWS_REGION
-          arguments: '--metadata "{\"x-amz-artifact-id\": \"${CIRCLE_SHA1}\" }"'
+          arguments: '--metadata "{\"x-amz-artifact-id\": \"${CIRCLE_TAG}\" }"'
 
   upload_checksum:
     description: "upload artifact checksum to s3"
@@ -92,25 +92,33 @@ commands:
 
   docker:
     description: "Build and Push image to docker hub"
+    parameters:
+      docker_image_tag:
+        type: string
+        default: "latest-staging"
     steps:
-      - setup_remote_docker
+      - setup_remote_docker:
+          docker_layer_caching: true
       - run:
           name: Building docker image
           command: |
-            docker build -t ${DOCKHUB_ORGANISATION}/binary-static-webtrader:${CIRCLE_SHA1} -t ${DOCKHUB_ORGANISATION}/binary-static-webtrader:latest .
+            docker build -t ${DOCKHUB_ORGANISATION}/binary-static-webtrader:${CIRCLE_TAG} -t ${DOCKHUB_ORGANISATION}/binary-static-webtrader:<< parameters.docker_image_tag >> .
       - run:
           name: Pushing Image to docker hub
           command: |
             echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
-            docker push ${DOCKHUB_ORGANISATION}/binary-static-webtrader:${CIRCLE_SHA1}
-            docker push ${DOCKHUB_ORGANISATION}/binary-static-webtrader:latest
+            docker push ${DOCKHUB_ORGANISATION}/binary-static-webtrader
 
   k8s_deploy:
     description: "Deploy to k8s cluster"
+    parameters:
+      k8s_svc_name:
+        type: string
+        default: "webtrader-binary-com"
     steps:
       - k8s/install-kubectl
       - run:
-          name: Deploying to k8s cluster for service binary-webtrader
+          name: Deploying to k8s cluster for service << parameters.k8s_svc_name >>
           command: |
             for SERVER_ID in {1..5}
             do
@@ -124,11 +132,28 @@ commands:
                 KUBE_SERVER="${!KUBE_SERVER_REF}"
                 SERVICEACCOUNT_TOKEN="${!SERVICEACCOUNT_TOKEN_REF}"
                 echo $CA_CRT | base64 --decode > ca.crt
-                kubectl --server=${KUBE_SERVER} --certificate-authority=ca.crt --token=$SERVICEACCOUNT_TOKEN set image deployment/webtrader-binary-com webtrader-binary-com=${DOCKHUB_ORGANISATION}/binary-static-webtrader:${CIRCLE_SHA1}
+                kubectl --server=${KUBE_SERVER} --certificate-authority=ca.crt --token=$SERVICEACCOUNT_TOKEN set image deployment/<< parameters.k8s_svc_name >> << parameters.k8s_svc_name >>=${DOCKHUB_ORGANISATION}/binary-static-webtrader:${CIRCLE_TAG}
               fi
             done
 jobs:
-  release:
+  test:
+    docker:
+      - image: circleci/node:12.13.0-stretch
+    steps:
+      - git_checkout_from_cache
+      - npm_install
+      - build
+
+  build_staging:
+    docker:
+      - image: circleci/node:12.13.0-stretch
+    steps:
+      - git_checkout_from_cache
+      - npm_install
+      - build
+      - docker
+  
+  build_production:
     docker:
       - image: circleci/node:12.13.0-stretch
     steps:
@@ -138,14 +163,62 @@ jobs:
       - compress
       - upload_artifact  # uploading the built code to s3 to create a backup of key services separate from Kubernetes deployment
       - upload_checksum  # uploading compressed artifact checksum to cross match artifact fingerprint before actual deployment
-      - docker
+      - docker:
+          docker_image_tag: latest
+
+  deploy_staging:
+    docker:
+      - image: circleci/node:12.13.0-stretch
+    steps:
       - k8s_deploy
 
+  deploy_production:
+    docker:
+      - image: circleci/node:12.13.0-stretch
+    steps:
+      - k8s_deploy:
+          k8s_svc_name: "production-webtrader-binary-com"
+
 workflows:
-  release:
+  build_and_push_dev:
     jobs:
-      - release:
+      - test:
           filters:
             branches:
-              only: /^master$/
+              only: /^master/
+  build_deploy_staging:
+    jobs:
+      - build_staging:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^staging.*/
           context: binary-frontend-artifact-upload  # using context to retrieve shared secret from circle ci
+      - deploy_staging:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^staging.*/
+          context: binary-frontend-artifact-upload  # using context to retrieve shared secret from circle ci
+          requires:
+            - build_staging
+  build_deploy_production:
+    jobs:
+      - build_production:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^production.*/
+          context: binary-frontend-artifact-upload  # using context to retrieve shared secret from circle ci
+      - deploy_production:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^production.*/
+          context: binary-frontend-artifact-upload  # using context to retrieve shared secret from circle ci
+          requires:
+            - build_production
